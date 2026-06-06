@@ -1,0 +1,15 @@
+name: "astrbot_plugin_weather"
+display_name: "天气主动推送"
+author: "zzby-poi"
+version: "0.1.0"
+desc: "基于 UAPI 天气接口的实时天气查询、定时推送和天气波动提醒插件。"
+repo: "https://github.com/zzby-poi/astrbot_plugin_weather"
+astrbot_version: ">=4.8.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - wecom
+  - lark
+  - dingtalk
+  - kook
