@@ -94,7 +94,7 @@ zzby
 用户可以通过自然语言设置所在地：
 
 ```text
-今天的天气怎么样
+我的城市是武汉武昌区
 ```
 
 如果当前会话没有记录城市，插件会引导用户输入所在地：
@@ -111,6 +111,9 @@ zzby
 ```
 
 后台 `query_settings.location_setting_keywords` 可以配置自然语言设置城市触发词，例如“设置城市”“我的城市是”。后台 `query_settings.weather_query_keywords` 用于配置查询天气触发词，例如“天气”“下雨”“温度”。
+
+默认开启 `query_settings.enable_ai_intent_detection`。命中触发词后，插件会先调用 `llm_generate()` 做轻量意图分类，只有模型判断为 `query_weather` 或 `set_location` 时才接管消息；如果判断为 `none`，会放行给 AstrBot 正常对话。
+`query_settings.intent_provider_id` 支持在后台通过“选择提供商”按钮从已配置模型列表中选择；留空时使用当前会话模型。
 
 插件会尽量记录最小区域：
 
@@ -172,6 +175,7 @@ zzby
 - `error_prompt`：天气接口错误、服务异常等提醒。
 - `location_guide_prompt`：当前会话未设置城市时，引导用户提供所在地。
 - `location_saved_prompt`：用户提供所在地后，确认记录成功。
+- `intent_detection_prompt`：命中触发词后的插件意图分类提示词。
 
 这些提示词都会尽量保留 AstrBot 当前人格、称呼习惯、语气和口癖。
 

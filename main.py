@@ -101,7 +101,8 @@ class WeatherPushPlugin(Star):
         location = (location or "").strip()
         if not location:
             self._set_pending_location(event)
-            yield event.plain_result(
+            yield self._plain_result(
+                event,
                 await self._format_error_message(
                     event,
                     WeatherAPIError(400, "还不知道用户所在地", code="LOCATION_MISSING"),
@@ -139,7 +140,8 @@ class WeatherPushPlugin(Star):
             async for result in self._yield_text_result(event, message):
                 yield result
         except Exception as exc:
-            yield event.plain_result(
+            yield self._plain_result(
+                event,
                 await self._format_error_message(
                     event,
                     exc,
@@ -152,7 +154,8 @@ class WeatherPushPlugin(Star):
     async def show_location(self, event: AstrMessageEvent):
         state = self._get_user_state(event)
         if not state or not state.get("location"):
-            yield event.plain_result(
+            yield self._plain_result(
+                event,
                 await self._format_error_message(
                     event,
                     WeatherAPIError(400, "还没有记录用户所在地", code="LOCATION_MISSING"),
@@ -160,14 +163,15 @@ class WeatherPushPlugin(Star):
                 )
             )
             return
-        yield event.plain_result(f"当前记录的所在地是：{state['location']}")
+        yield self._plain_result(event, f"当前记录的所在地是：{state['location']}")
 
     @weather_group.command("测试推送")
     async def test_push(self, event: AstrMessageEvent):
         state = self._get_user_state(event)
         if not state or not state.get("location"):
             self._set_pending_location(event)
-            yield event.plain_result(
+            yield self._plain_result(
+                event,
                 await self._format_error_message(
                     event,
                     WeatherAPIError(400, "测试推送前需要先知道用户所在地", code="LOCATION_MISSING"),
@@ -222,12 +226,30 @@ class WeatherPushPlugin(Star):
         if self._looks_like_weather_command(text):
             return
 
-        is_weather_intent = self._is_weather_intent(text)
-        if self._is_location_setting_intent(text) and not is_weather_intent:
+        is_weather_keyword = self._is_weather_intent(text)
+        is_location_keyword = self._is_location_setting_intent(text)
+        if not (is_weather_keyword or is_location_keyword):
+            return
+
+        intent_decision = await self._decide_plugin_intent(
+            event,
+            text,
+            weather_keyword=is_weather_keyword,
+            location_keyword=is_location_keyword,
+        )
+        if not intent_decision.get("use_plugin"):
+            return
+
+        intent = str(intent_decision.get("intent") or "").strip()
+        if intent == "set_location":
             location_candidates = self._extract_location_candidates(text)
+            llm_location = str(intent_decision.get("location") or "").strip()
+            if llm_location:
+                location_candidates.insert(0, llm_location)
             if not location_candidates:
                 self._set_pending_location(event)
-                yield event.plain_result(
+                yield self._plain_result(
+                    event,
                     await self._format_error_message(
                         event,
                         WeatherAPIError(
@@ -255,14 +277,18 @@ class WeatherPushPlugin(Star):
                     yield reply
             return
 
-        if not is_weather_intent:
+        if intent != "query_weather":
             return
 
         state = self._get_user_state(event)
         location_candidates = self._extract_location_candidates(text)
+        llm_location = str(intent_decision.get("location") or "").strip()
+        if llm_location:
+            location_candidates.insert(0, llm_location)
         if not location_candidates and not (state and state.get("location")):
             self._set_pending_location(event)
-            yield event.plain_result(
+            yield self._plain_result(
+                event,
                 await self._format_error_message(
                     event,
                     WeatherAPIError(400, "用户询问天气但没有提供城市或区县", code="LOCATION_MISSING"),
@@ -272,7 +298,7 @@ class WeatherPushPlugin(Star):
             return
 
         if not self._is_allowed_query(event):
-            yield event.plain_result("当前会话没有开启天气查询权限。")
+            yield self._plain_result(event, "当前会话没有开启天气查询权限。")
             return
 
         try:
@@ -286,7 +312,8 @@ class WeatherPushPlugin(Star):
             async for result in self._yield_text_result(event, message):
                 yield result
         except Exception as exc:
-            yield event.plain_result(
+            yield self._plain_result(
+                event,
                 await self._format_error_message(
                     event,
                     exc,
@@ -921,6 +948,138 @@ class WeatherPushPlugin(Star):
             return self._strip_location_suffix(city)
         return self._strip_location_suffix(fallback)
 
+    async def _decide_plugin_intent(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        weather_keyword: bool,
+        location_keyword: bool,
+    ) -> dict[str, Any]:
+        if not self._get_cfg("enable_ai_intent_detection", True, "query_settings"):
+            return self._keyword_plugin_intent(weather_keyword, location_keyword)
+
+        prompt_template = self.config.get("prompt_settings", {}).get(
+            "intent_detection_prompt", ""
+        ) or self._default_intent_detection_prompt()
+        state = self._get_user_state(event) or {}
+        prompt = self._fill_template(
+            prompt_template,
+            {
+                "current_time": self._now_str(),
+                "user_message": text,
+                "current_location": str(state.get("location") or ""),
+                "weather_keywords": "是" if weather_keyword else "否",
+                "location_keywords": "是" if location_keyword else "否",
+            },
+        )
+
+        try:
+            provider_id = str(
+                self._get_cfg("intent_provider_id", "", "query_settings") or ""
+            ).strip()
+            timeout = self._bounded_int(
+                self._get_cfg("intent_timeout_seconds", 8, "query_settings"),
+                1,
+                60,
+                8,
+            )
+            response = await self._llm_text(
+                event.unified_msg_origin,
+                prompt,
+                provider_id=provider_id or None,
+                timeout=timeout,
+            )
+            payload = self._parse_json_object(response)
+            decision = self._normalize_plugin_intent(payload)
+            min_confidence = float(
+                self._get_cfg("intent_min_confidence", 0.55, "query_settings")
+                or 0.55
+            )
+            if float(decision.get("confidence") or 0) < min_confidence:
+                return self._empty_plugin_intent()
+            return decision
+        except Exception as exc:
+            logger.debug(f"[天气推送] AI 意图判断失败: {exc}")
+            fail_strategy = str(
+                self._get_cfg("intent_fail_strategy", "pass", "query_settings")
+                or "pass"
+            ).strip()
+            if fail_strategy == "keyword":
+                return self._keyword_plugin_intent(weather_keyword, location_keyword)
+            return self._empty_plugin_intent()
+
+    def _default_intent_detection_prompt(self) -> str:
+        return (
+            "[系统任务：天气插件意图分类]\n"
+            "你只判断用户这句话是否应该交给天气插件处理。只返回 JSON，不要解释。\n\n"
+            "[用户消息]\n{{user_message}}\n\n"
+            "[上下文]\n"
+            "- 当前时间：{{current_time}}\n"
+            "- 当前已记录所在地：{{current_location}}\n"
+            "- 是否命中查询天气关键词：{{weather_keywords}}\n"
+            "- 是否命中设置城市关键词：{{location_keywords}}\n\n"
+            "[可选意图]\n"
+            "1. query_weather：用户明确想查询天气、预报、降雨、温度、穿衣/带伞等与天气数据直接相关的信息。\n"
+            "2. set_location：用户明确想设置或告知天气所在地。\n"
+            "3. none：用户只是顺带提到天气，真实需求是闲聊、景点推荐、出行规划、心情表达或其他非天气插件能力。\n\n"
+            "[判断规则]\n"
+            "- “今天天气真好，我想去外面转转，有什么景点推荐吗”应判为 none。\n"
+            "- “今天的天气怎么样”“明天会下雨吗”“雨什么时候停”应判为 query_weather。\n"
+            "- “我的城市是武汉武昌区”“设置城市武汉”应判为 set_location。\n"
+            "- 如果用户只是把天气当背景，不要使用插件。\n"
+            "- 如果无法确定，返回 use_plugin=false。\n\n"
+            "[输出 JSON]\n"
+            '{"use_plugin":false,"intent":"none","location":"","confidence":0.0}'
+        )
+
+    def _keyword_plugin_intent(
+        self, weather_keyword: bool, location_keyword: bool
+    ) -> dict[str, Any]:
+        if location_keyword and not weather_keyword:
+            return {
+                "use_plugin": True,
+                "intent": "set_location",
+                "location": "",
+                "confidence": 1.0,
+            }
+        if weather_keyword:
+            return {
+                "use_plugin": True,
+                "intent": "query_weather",
+                "location": "",
+                "confidence": 1.0,
+            }
+        return self._empty_plugin_intent()
+
+    def _empty_plugin_intent(self) -> dict[str, Any]:
+        return {
+            "use_plugin": False,
+            "intent": "none",
+            "location": "",
+            "confidence": 0.0,
+        }
+
+    def _normalize_plugin_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return self._empty_plugin_intent()
+        intent = str(payload.get("intent") or "none").strip()
+        if intent not in {"query_weather", "set_location", "none"}:
+            intent = "none"
+        use_plugin = self._parse_bool_setting(payload.get("use_plugin"), False)
+        if intent == "none":
+            use_plugin = False
+        try:
+            confidence = float(payload.get("confidence") or 0)
+        except Exception:
+            confidence = 0.0
+        return {
+            "use_plugin": bool(use_plugin),
+            "intent": intent,
+            "location": str(payload.get("location") or "").strip(),
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+
     async def _decide_extensions(self, umo: str, user_message: str) -> dict[str, bool]:
         rule_decision = self._rule_extensions_from_message(user_message)
         max_allowed = self._get_cfg("query_extensions_max", {}, "query_settings")
@@ -1251,26 +1410,45 @@ class WeatherPushPlugin(Star):
         *,
         contexts: list[Any] | None = None,
         system_prompt: str | None = None,
+        provider_id: str | None = None,
+        timeout: int | None = None,
     ) -> str:
         try:
-            provider_id = await self.context.get_current_chat_provider_id(umo)
-            resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
+            chat_provider_id = provider_id or await self.context.get_current_chat_provider_id(
+                umo
+            )
+            coro = self.context.llm_generate(
+                chat_provider_id=chat_provider_id,
                 prompt=prompt,
                 contexts=contexts or [],
                 system_prompt=system_prompt or "",
             )
-            return (getattr(resp, "completion_text", "") or "").strip()
+            resp = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+            return self._completion_text_from_response(resp)
         except Exception as first_error:
+            if provider_id:
+                raise first_error
             provider = self.context.get_using_provider(umo=umo)
             if not provider:
                 raise first_error
-            resp = await provider.text_chat(
+            coro = provider.text_chat(
                 prompt=prompt,
                 contexts=contexts or [],
                 system_prompt=system_prompt or "",
             )
-            return (getattr(resp, "completion_text", "") or "").strip()
+            resp = await asyncio.wait_for(coro, timeout=timeout) if timeout else await coro
+            return self._completion_text_from_response(resp)
+
+    def _completion_text_from_response(self, resp: Any) -> str:
+        if isinstance(resp, str):
+            return resp.strip()
+        if isinstance(resp, dict):
+            for key in ["completion_text", "text", "content", "response"]:
+                value = resp.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return ""
+        return (getattr(resp, "completion_text", "") or "").strip()
 
     async def _llm_text_with_persona(
         self,
@@ -1736,13 +1914,7 @@ class WeatherPushPlugin(Star):
     def _parse_bool_json(self, text: str) -> dict[str, bool]:
         if not text:
             return {}
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            return {}
-        try:
-            payload = json.loads(match.group(0))
-        except Exception:
-            return {}
+        payload = self._parse_json_object(text)
         if not isinstance(payload, dict):
             return {}
         result = {}
@@ -1750,6 +1922,19 @@ class WeatherPushPlugin(Star):
             if key in payload:
                 result[key] = bool(payload[key])
         return result
+
+    def _parse_json_object(self, text: str) -> dict[str, Any]:
+        if not text:
+            return {}
+        match = re.search(r"\{.*\}", str(text), flags=re.DOTALL)
+        if not match:
+            return {}
+        raw = match.group(0).strip()
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     def _is_weather_intent(self, text: str) -> bool:
         return self._contains_any_keyword(text, self._weather_query_keywords())
@@ -2037,9 +2222,27 @@ class WeatherPushPlugin(Star):
             return
 
         for idx, segment in enumerate(segments):
-            yield event.plain_result(segment)
+            yield self._plain_result(event, segment)
             if idx < len(segments) - 1:
                 await asyncio.sleep(await self._calc_interval(segment, settings))
+
+    def _plain_result(self, event: AstrMessageEvent, text: str):
+        result = event.plain_result(text)
+        if self._should_bypass_external_splitter(event):
+            # Avoid external splitters re-splitting weather plugin segments.
+            setattr(result, "__splitter_processed", True)
+        return result
+
+    def _should_bypass_external_splitter(self, event: AstrMessageEvent) -> bool:
+        settings = self._get_segment_settings()
+        allow_external = self._parse_bool_setting(
+            settings.get("allow_external_splitter", True), True
+        )
+        if self._segment_reply_enabled():
+            return True
+        if not allow_external:
+            return True
+        return self._is_webchat_event(event)
 
     async def _send_text(self, umo: str, text: str) -> None:
         segments = self._split_reply_text(text)
