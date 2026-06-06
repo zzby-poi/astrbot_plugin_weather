@@ -309,60 +309,96 @@ class WeatherPushPlugin(Star):
         self.scheduler.start()
 
     async def _run_daily_push(self) -> None:
-        for user_key, state in list(self.user_data.items()):
-            if not self._is_allowed_push(user_key, state):
-                continue
-            if not state.get("location"):
-                continue
+        extensions = self._configured_extensions("daily_extensions")
+        grouped_targets = self._group_push_targets(extensions)
+        dirty = False
+
+        for group_key, targets in grouped_targets.items():
+            adcode, city, extension_items = group_key
             try:
-                message = await self._build_weather_message(
-                    user_key,
-                    state,
-                    reason="每日定时天气推送",
-                    mode="push",
-                    extensions=self._configured_extensions("daily_extensions"),
+                weather = await self._query_weather(
+                    city=city,
+                    adcode=adcode,
+                    extensions=dict(extension_items),
                 )
-                await self._send_text(user_key, message)
             except Exception as exc:
-                logger.error(f"[天气推送] 每日推送失败: {user_key}: {exc}")
+                logger.error(
+                    f"[天气推送] 每日推送天气查询失败: location={adcode or city}, "
+                    f"users={len(targets)}, error={exc}"
+                )
+                continue
+
+            snapshot = self._weather_snapshot(weather)
+            for user_key, state in targets:
+                try:
+                    state["last_weather"] = dict(snapshot)
+                    dirty = True
+                    message = await self._render_weather_message(
+                        user_key,
+                        state.get("location", ""),
+                        weather,
+                        reason="每日定时天气推送",
+                        mode="push",
+                    )
+                    await self._send_text(user_key, message)
+                except Exception as exc:
+                    logger.error(f"[天气推送] 每日推送失败: {user_key}: {exc}")
+
+        if dirty:
+            async with self._ensure_lock():
+                self._save_json(self.data_file, self.user_data)
 
     async def _run_weather_monitor(self) -> None:
-        for user_key, state in list(self.user_data.items()):
-            if not self._is_allowed_push(user_key, state):
-                continue
-            if not state.get("location"):
-                continue
+        extensions = self._configured_extensions(
+            "monitor_extensions", root="monitor_settings"
+        )
+        grouped_targets = self._group_push_targets(extensions)
+        dirty = False
+
+        for group_key, targets in grouped_targets.items():
+            adcode, city, extension_items = group_key
             try:
-                extensions = self._configured_extensions(
-                    "monitor_extensions", root="monitor_settings"
+                weather = await self._query_weather(
+                    city=city,
+                    adcode=adcode,
+                    extensions=dict(extension_items),
                 )
-                weather = await self._query_weather_by_state(state, extensions)
-                alert_reason = self._detect_weather_change(state, weather)
-                state["last_weather"] = self._weather_snapshot(weather)
-                async with self._ensure_lock():
-                    self.user_data[user_key] = state
-                    self._save_json(self.data_file, self.user_data)
-
-                if not alert_reason:
-                    continue
-                if self._is_in_alert_cooldown(state):
-                    continue
-
-                state["last_alert_at"] = time.time()
-                async with self._ensure_lock():
-                    self.user_data[user_key] = state
-                    self._save_json(self.data_file, self.user_data)
-
-                message = await self._render_weather_message(
-                    user_key,
-                    state.get("location", ""),
-                    weather,
-                    reason=alert_reason,
-                    mode="push",
-                )
-                await self._send_text(user_key, message)
             except Exception as exc:
-                logger.error(f"[天气推送] 天气波动监测失败: {user_key}: {exc}")
+                logger.error(
+                    f"[天气推送] 天气波动查询失败: location={adcode or city}, "
+                    f"users={len(targets)}, error={exc}"
+                )
+                continue
+
+            snapshot = self._weather_snapshot(weather)
+            for user_key, state in targets:
+                try:
+                    alert_reason = self._detect_weather_change(state, weather)
+                    state["last_weather"] = dict(snapshot)
+                    dirty = True
+
+                    if not alert_reason:
+                        continue
+                    if self._is_in_alert_cooldown(state):
+                        continue
+
+                    state["last_alert_at"] = time.time()
+                    dirty = True
+
+                    message = await self._render_weather_message(
+                        user_key,
+                        state.get("location", ""),
+                        weather,
+                        reason=alert_reason,
+                        mode="push",
+                    )
+                    await self._send_text(user_key, message)
+                except Exception as exc:
+                    logger.error(f"[天气推送] 天气波动监测失败: {user_key}: {exc}")
+
+        if dirty:
+            async with self._ensure_lock():
+                self._save_json(self.data_file, self.user_data)
 
     async def _handle_weather_query(
         self,
@@ -418,11 +454,53 @@ class WeatherPushPlugin(Star):
             mode=mode,
         )
 
+    def _group_push_targets(
+        self, extensions: dict[str, bool]
+    ) -> dict[
+        tuple[str, str, tuple[tuple[str, bool], ...]],
+        list[tuple[str, dict[str, Any]]],
+    ]:
+        grouped: dict[
+            tuple[str, str, tuple[tuple[str, bool], ...]],
+            list[tuple[str, dict[str, Any]]],
+        ] = {}
+        extension_key = self._extensions_group_key(extensions)
+        for user_key, state in list(self.user_data.items()):
+            if not isinstance(state, dict):
+                continue
+            if not self._is_allowed_push(user_key, state):
+                continue
+            if not str(state.get("location") or "").strip():
+                continue
+
+            city, adcode = self._weather_query_params_from_state(state)
+            if not (city or adcode):
+                continue
+
+            query_city = "" if adcode else city
+            key = (adcode, query_city, extension_key)
+            grouped.setdefault(key, []).append((user_key, state))
+        return grouped
+
+    def _extensions_group_key(
+        self, extensions: dict[str, bool] | None
+    ) -> tuple[tuple[str, bool], ...]:
+        return tuple(
+            (key, bool((extensions or {}).get(key, False)))
+            for key in ["extended", "forecast", "hourly", "minutely", "indices"]
+        )
+
+    def _weather_query_params_from_state(
+        self, state: dict[str, Any]
+    ) -> tuple[str, str]:
+        adcode = str(state.get("adcode") or "").strip()
+        city = str(state.get("query_city") or state.get("location") or "").strip()
+        return city, adcode
+
     async def _query_weather_by_state(
         self, state: dict[str, Any], extensions: dict[str, bool]
     ) -> dict[str, Any]:
-        adcode = str(state.get("adcode") or "").strip()
-        city = str(state.get("query_city") or state.get("location") or "").strip()
+        city, adcode = self._weather_query_params_from_state(state)
         return await self._query_weather(city=city, adcode=adcode, extensions=extensions)
 
     async def _query_weather(
