@@ -113,6 +113,18 @@
         "type": "int",
         "default": 120
       },
+      "enable_quiet_hours": {
+        "description": "启用免打扰时间段",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，在指定时间段内不执行天气波动监测，不查询接口也不更新上次天气快照。"
+      },
+      "quiet_hours": {
+        "description": "免打扰时间段",
+        "type": "list",
+        "default": ["23:00-07:30"],
+        "hint": "格式 HH:MM-HH:MM，支持多个时间段和跨天，例如 23:00-07:30。"
+      },
       "temperature_delta_threshold": {
         "description": "温度变化阈值",
         "type": "float",
@@ -318,6 +330,18 @@
         "type": "bool",
         "default": true,
         "hint": "天气插件自身分段关闭时，非 webchat 平台允许 astrbot_plugin_splitter 等外部分段插件统一处理天气回复；webchat 会自动整段输出以避免截断。"
+      },
+      "segment_push_messages": {
+        "description": "主动推送消息分段",
+        "type": "bool",
+        "default": true,
+        "hint": "用于每日推送和天气波动提醒。主动发送没有普通消息事件，无法交给 astrbot_plugin_splitter，因此这里单独控制是否按下方规则分段。"
+      },
+      "push_words_count_threshold": {
+        "description": "主动推送不分段字数阈值",
+        "type": "int",
+        "default": 10000,
+        "hint": "仅用于每日推送和天气波动提醒。超过该值才整段发送，填 0 表示不限制；普通查询仍使用下方的不分段字数阈值。"
       },
       "words_count_threshold": {
         "description": "不分段字数阈值",

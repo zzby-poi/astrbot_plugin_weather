@@ -409,6 +409,10 @@ class WeatherPushPlugin(Star):
                 self._save_json(self.data_file, self.user_data)
 
     async def _run_weather_monitor(self) -> None:
+        if self._is_monitor_quiet_time():
+            logger.debug("[天气推送] 当前处于天气波动监测免打扰时间段，跳过本轮监测。")
+            return
+
         extensions = self._configured_extensions(
             "monitor_extensions", root="monitor_settings"
         )
@@ -1225,6 +1229,53 @@ class WeatherPushPlugin(Star):
         )
         last_alert_at = float(state.get("last_alert_at") or 0)
         return time.time() - last_alert_at < cooldown * 60
+
+    def _is_monitor_quiet_time(self) -> bool:
+        if not self._parse_bool_setting(
+            self._get_cfg("enable_quiet_hours", False, "monitor_settings"), False
+        ):
+            return False
+        ranges = self._list_setting(
+            self._get_cfg("quiet_hours", [], "monitor_settings")
+        )
+        if not ranges:
+            return False
+        now = datetime.now(self.timezone)
+        now_minutes = now.hour * 60 + now.minute
+        for raw_range in ranges:
+            parsed = self._parse_time_range(str(raw_range or ""))
+            if not parsed:
+                logger.warning(f"[天气推送] 忽略无效免打扰时间段: {raw_range}")
+                continue
+            start_minutes, end_minutes = parsed
+            if self._minutes_in_range(now_minutes, start_minutes, end_minutes):
+                return True
+        return False
+
+    def _parse_time_range(self, value: str) -> tuple[int, int] | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        match = re.fullmatch(
+            r"\s*(\d{1,2}:\d{1,2})\s*(?:-|~|～|至|到)\s*(\d{1,2}:\d{1,2})\s*",
+            raw,
+        )
+        if not match:
+            return None
+        start = self._parse_clock_time(match.group(1))
+        end = self._parse_clock_time(match.group(2))
+        if not start or not end:
+            return None
+        return start[0] * 60 + start[1], end[0] * 60 + end[1]
+
+    def _minutes_in_range(
+        self, now_minutes: int, start_minutes: int, end_minutes: int
+    ) -> bool:
+        if start_minutes == end_minutes:
+            return True
+        if start_minutes < end_minutes:
+            return start_minutes <= now_minutes < end_minutes
+        return now_minutes >= start_minutes or now_minutes < end_minutes
 
     async def _render_weather_message(
         self,
@@ -2245,7 +2296,7 @@ class WeatherPushPlugin(Star):
         return self._is_webchat_event(event)
 
     async def _send_text(self, umo: str, text: str) -> None:
-        segments = self._split_reply_text(text)
+        segments = self._split_push_text(text)
         settings = self._get_segment_settings()
         for idx, segment in enumerate(segments):
             await self.context.send_message(umo, MessageChain([Plain(segment)]))
@@ -2259,6 +2310,12 @@ class WeatherPushPlugin(Star):
     def _segment_reply_enabled(self) -> bool:
         settings = self._get_segment_settings()
         return self._parse_bool_setting(settings.get("enable", False), False)
+
+    def _segment_push_enabled(self) -> bool:
+        settings = self._get_segment_settings()
+        return self._parse_bool_setting(
+            settings.get("segment_push_messages", True), True
+        )
 
     def _is_webchat_event(self, event: AstrMessageEvent) -> bool:
         umo = str(getattr(event, "unified_msg_origin", "") or "")
@@ -2284,13 +2341,40 @@ class WeatherPushPlugin(Star):
         settings = self._get_segment_settings()
         if not self._segment_reply_enabled():
             return [text]
+        return self._split_text_with_settings(text)
 
-        threshold = self._bounded_int(
-            settings.get("words_count_threshold", 220), 0, 10000, 220
+    def _split_push_text(self, text: str) -> list[str]:
+        if not self._segment_push_enabled():
+            return [str(text or "")]
+        return self._split_text_with_settings(
+            text,
+            threshold_key="push_words_count_threshold",
+            default_threshold=10000,
+            zero_disables=False,
         )
-        if len(text) > threshold:
-            return [text]
 
+    def _split_text_with_settings(
+        self,
+        text: str,
+        *,
+        threshold_key: str = "words_count_threshold",
+        default_threshold: int = 220,
+        zero_disables: bool = True,
+    ) -> list[str]:
+        text = str(text or "")
+        if not text:
+            return [""]
+        settings = self._get_segment_settings()
+        threshold = self._bounded_int(
+            settings.get(threshold_key, default_threshold),
+            0,
+            10000,
+            default_threshold,
+        )
+        if threshold == 0 and zero_disables:
+            return [text]
+        if threshold > 0 and len(text) > threshold:
+            return [text]
         segments = self._split_text(text, settings)
         return [segment for segment in segments if segment.strip()] or [text]
 

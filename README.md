@@ -138,11 +138,14 @@ zzby
 - `enable_monitor`：是否启用天气波动监测。
 - `monitor_interval_minutes`：监测查询间隔，默认 30 分钟。
 - `alert_cooldown_minutes`：同一会话提醒冷却时间。
+- `enable_quiet_hours`：是否启用免打扰时间段。
+- `quiet_hours`：免打扰时间段列表，格式为 `HH:MM-HH:MM`，支持跨天，例如 `23:00-07:30`。
 - `temperature_delta_threshold`：温度变化阈值。
 - `humidity_delta_threshold`：湿度变化阈值。
 - `monitor_extensions`：监测查询时使用的扩展信息。
 
 当天气现象改变，或温度、湿度变化超过阈值时，插件会向白名单用户发送提醒。
+免打扰时间段内不会执行天气波动监测，也不会更新上一次天气快照。
 波动提醒文案使用 `prompt_settings.weather_alert_prompt`，可与每日主动推送提示词分开配置。
 
 ## 扩展天气字段
@@ -213,6 +216,9 @@ zzby
 `segmented_reply_settings`
 
 - `enable`：是否启用分段回复。
+- `allow_external_splitter`：插件自身分段关闭时，非 webchat 平台的普通天气查询可交给 `astrbot_plugin_splitter` 等外部分段插件处理；webchat 会自动整段输出，避免页面截断。
+- `segment_push_messages`：是否对每日推送和天气波动提醒启用本插件分段。主动推送没有普通消息结果事件，无法交给 `astrbot_plugin_splitter` 处理。
+- `push_words_count_threshold`：主动推送的“不分段字数阈值”，默认较高，避免天气波动提醒因为文本较长而整段发送；填 `0` 表示不限制。
 - `words_count_threshold`：文本长度小于等于该值时才分段；更长文本整段发送。
 - `split_mode`：分段方式，支持 `regex` 和 `words`。
 - `regex`：正则分段规则。
@@ -223,7 +229,7 @@ zzby
 - `interval`：随机间隔秒数，例如 `1.0, 2.5`。
 - `log_base`：对数间隔基数。
 
-webchat 页面有特殊显示逻辑，插件会在 webchat 分段时使用主动发送并终止原事件，避免最后一段覆盖前面的分段。
+webchat 页面有特殊显示逻辑。普通查询在 webchat 中会绕过外部分段器，避免最后一段覆盖前面的内容；其他平台可按配置交给外部分段器。每日推送和天气波动提醒属于主动发送，由本插件按 `segment_push_messages` 和 `push_words_count_threshold` 控制分段。
 
 ## 常用命令
 
