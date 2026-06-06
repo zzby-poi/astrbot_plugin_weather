@@ -222,7 +222,40 @@ class WeatherPushPlugin(Star):
         if self._looks_like_weather_command(text):
             return
 
-        if not self._is_weather_intent(text):
+        is_weather_intent = self._is_weather_intent(text)
+        if self._is_location_setting_intent(text) and not is_weather_intent:
+            location_candidates = self._extract_location_candidates(text)
+            if not location_candidates:
+                self._set_pending_location(event)
+                yield event.plain_result(
+                    await self._format_error_message(
+                        event,
+                        WeatherAPIError(
+                            400,
+                            "用户想设置天气所在地但没有提供城市或区县",
+                            code="LOCATION_MISSING",
+                        ),
+                        user_message=text,
+                    )
+                )
+                return
+            try:
+                result = await self._save_location_from_text(event, text)
+                async for reply in self._yield_text_result(event, result):
+                    yield reply
+            except Exception as exc:
+                self._set_pending_location(event)
+                message = await self._format_error_message(
+                    event,
+                    exc,
+                    location=location_candidates[0],
+                    user_message=text,
+                )
+                async for reply in self._yield_text_result(event, message):
+                    yield reply
+            return
+
+        if not is_weather_intent:
             return
 
         state = self._get_user_state(event)
@@ -390,7 +423,7 @@ class WeatherPushPlugin(Star):
                         state.get("location", ""),
                         weather,
                         reason=alert_reason,
-                        mode="push",
+                        mode="alert",
                     )
                     await self._send_text(user_key, message)
                 except Exception as exc:
@@ -637,6 +670,8 @@ class WeatherPushPlugin(Star):
             "呀",
             "啊",
             "吧",
+            *self._weather_query_keywords(),
+            *self._location_setting_keywords(),
         ]:
             cleaned = cleaned.replace(word, "")
         cleaned = re.sub(r"[\s,，。.!！？?：:；;“”\"'（）()【】\[\]<>《》]+", "", cleaned)
@@ -1045,8 +1080,17 @@ class WeatherPushPlugin(Star):
         if not self._get_cfg("enable_llm_message", True, "push_settings"):
             return self._fallback_weather_message(location, weather, reason)
 
-        prompt_key = "weather_query_prompt" if mode == "query" else "weather_push_prompt"
+        if mode == "query":
+            prompt_key = "weather_query_prompt"
+        elif mode == "alert":
+            prompt_key = "weather_alert_prompt"
+        else:
+            prompt_key = "weather_push_prompt"
         prompt_template = self.config.get("prompt_settings", {}).get(prompt_key, "")
+        if not prompt_template and mode == "alert":
+            prompt_template = self.config.get("prompt_settings", {}).get(
+                "weather_push_prompt", ""
+            )
         if not prompt_template:
             return self._fallback_weather_message(location, weather, reason)
 
@@ -1708,8 +1752,62 @@ class WeatherPushPlugin(Star):
         return result
 
     def _is_weather_intent(self, text: str) -> bool:
-        keywords = self._get_cfg("trigger_keywords", [], "query_settings")
-        return any(str(keyword) and str(keyword) in text for keyword in keywords)
+        return self._contains_any_keyword(text, self._weather_query_keywords())
+
+    def _is_location_setting_intent(self, text: str) -> bool:
+        return self._contains_any_keyword(text, self._location_setting_keywords())
+
+    def _weather_query_keywords(self) -> list[str]:
+        query_cfg = self.config.get("query_settings", {})
+        if not isinstance(query_cfg, dict):
+            query_cfg = {}
+        keywords = self._normalize_keywords(
+            [
+                *self._list_setting(query_cfg.get("weather_query_keywords")),
+                *self._list_setting(query_cfg.get("trigger_keywords")),
+            ]
+        )
+        if keywords:
+            return keywords
+        return ["天气", "下雨", "降雨", "温度", "气温", "雨什么时候停", "今天会下雨吗"]
+
+    def _location_setting_keywords(self) -> list[str]:
+        query_cfg = self.config.get("query_settings", {})
+        if not isinstance(query_cfg, dict):
+            query_cfg = {}
+        keywords = self._normalize_keywords(
+            self._list_setting(query_cfg.get("location_setting_keywords"))
+        )
+        if keywords:
+            return keywords
+        return [
+            "设置城市",
+            "设置天气城市",
+            "设置所在地",
+            "我的所在地是",
+            "我的城市是",
+            "我住在",
+        ]
+
+    def _contains_any_keyword(self, text: str, keywords: list[str]) -> bool:
+        return any(keyword and keyword in text for keyword in keywords)
+
+    def _normalize_keywords(self, keywords: list[Any]) -> list[str]:
+        normalized: list[str] = []
+        for item in keywords:
+            keyword = str(item or "").strip()
+            if keyword and keyword not in normalized:
+                normalized.append(keyword)
+        return normalized
+
+    def _list_setting(self, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return [item.strip() for item in re.split(r"[,，\n]+", value) if item.strip()]
+        return [value]
 
     def _looks_like_weather_command(self, text: str) -> bool:
         return text.startswith("/天气 ") or text.startswith("天气 设置") or text.startswith("天气 查询")

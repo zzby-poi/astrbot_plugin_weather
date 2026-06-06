@@ -110,6 +110,8 @@ zzby
 天气 我的城市
 ```
 
+后台 `query_settings.location_setting_keywords` 可以配置自然语言设置城市触发词，例如“设置城市”“我的城市是”。后台 `query_settings.weather_query_keywords` 用于配置查询天气触发词，例如“天气”“下雨”“温度”。
+
 插件会尽量记录最小区域：
 
 - “湖北武汉”会记录为“武汉”
@@ -138,6 +140,7 @@ zzby
 - `monitor_extensions`：监测查询时使用的扩展信息。
 
 当天气现象改变，或温度、湿度变化超过阈值时，插件会向白名单用户发送提醒。
+波动提醒文案使用 `prompt_settings.weather_alert_prompt`，可与每日主动推送提示词分开配置。
 
 ## 扩展天气字段
 
@@ -164,6 +167,7 @@ zzby
 可配置以下提示词：
 
 - `weather_push_prompt`：主动天气推送文案。
+- `weather_alert_prompt`：天气波动监测触发后的提醒文案。
 - `weather_query_prompt`：用户查询天气时的回复。
 - `error_prompt`：天气接口错误、服务异常等提醒。
 - `location_guide_prompt`：当前会话未设置城市时，引导用户提供所在地。
@@ -254,4 +258,3 @@ AstrBot/data/plugin_data/astrbot_plugin_weather/weather_users.json
 - 如果设置了 `allow_non_whitelist_query=false`，非白名单会话无法即时查询天气。
 - ApiKey 留空时使用免费接口，具体额度和限制请以 UAPI 官方说明为准。
 - 若天气接口返回城市未找到，请尝试使用更标准的城市或区县名，例如“武汉武昌区”。
-
